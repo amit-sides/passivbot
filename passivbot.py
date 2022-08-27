@@ -346,7 +346,6 @@ class Bot:
                 try:
                     o = await c
                     created_orders.append(o)
-                    logging.info(f"O: {o}")
                     if "side" in o:
                         logging.info(
                             f'  created order {o["symbol"]} {o["side"]: <4} '
