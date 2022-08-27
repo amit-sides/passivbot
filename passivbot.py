@@ -110,7 +110,7 @@ class Bot:
 
         self.log_filepath = make_get_filepath(f"logs/{self.exchange}/{config['config_name']}.log")
 
-        _, self.key, self.secret = load_exchange_key_secret(self.user)
+        _, self.key, self.secret = load_exchange_key_secret(self.user, config["api_keys"])
 
         self.log_level = 0
 
@@ -1166,6 +1166,7 @@ async def main() -> None:
         logging.error(f"{e} failed to load config {args.live_config_path}")
         return
     config["user"] = args.user
+    config["api-keys"] = args.api_keys
     config["exchange"] = account["exchange"]
     config["test_mode"] = args.test_mode
     if config["test_mode"] and config["exchange"] not in TEST_MODE_SUPPORTED_EXCHANGES:
