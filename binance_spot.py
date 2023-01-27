@@ -46,6 +46,8 @@ class BinanceBotSpot(Bot):
         self.headers = {"X-MBX-APIKEY": self.key}
         self.base_endpoint = ""
         self.force_update_interval = 40
+        self.max_n_orders_per_batch = 5
+        self.max_n_cancellations_per_batch = 10
 
     async def public_get(self, url: str, params: dict = {}) -> dict:
         async with self.session.get(self.base_endpoint + url, params=params) as response:
@@ -138,9 +140,13 @@ class BinanceBotSpot(Bot):
                         self.price_step = self.config["price_step"] = float(q["tickSize"])
                         self.min_price = float(q["minPrice"])
                         self.max_price = float(q["maxPrice"])
-                    elif q["filterType"] == "PERCENT_PRICE":
-                        self.price_multiplier_up = float(q["multiplierUp"])
-                        self.price_multiplier_dn = float(q["multiplierDown"])
+                    elif q["filterType"] == "PERCENT_PRICE_BY_SIDE":
+                        self.price_multiplier_up = min(
+                            float(q["bidMultiplierUp"]), float(q["askMultiplierUp"])
+                        )
+                        self.price_multiplier_dn = max(
+                            float(q["bidMultiplierDown"]), float(q["askMultiplierDown"])
+                        )
                     elif q["filterType"] == "MIN_NOTIONAL":
                         self.min_cost = self.config["min_cost"] = float(q["minNotional"])
                 try:
@@ -258,6 +264,56 @@ class BinanceBotSpot(Bot):
             + balance[self.coin]["onhand"] * pprice_long,
         }
         return position
+
+    async def execute_orders(self, orders: [dict]) -> [dict]:
+        if not orders:
+            return []
+        creations = []
+        for order in sorted(orders, key=lambda x: calc_diff(x["price"], self.price)):
+            creation = None
+            try:
+                creation = asyncio.create_task(self.execute_order(order))
+                creations.append((order, creation))
+            except Exception as e:
+                print(f"error creating order {order} {e}")
+                print_async_exception(creation)
+                traceback.print_exc()
+        results = []
+        for creation in creations:
+            result = None
+            try:
+                result = await creation[1]
+                results.append(result)
+            except Exception as e:
+                print(f"error creating order {creation} {e}")
+                print_async_exception(result)
+                traceback.print_exc()
+        return results
+
+    async def execute_cancellations(self, orders: [dict]) -> [dict]:
+        if not orders:
+            return []
+        cancellations = []
+        for order in sorted(orders, key=lambda x: calc_diff(x["price"], self.price)):
+            cancellation = None
+            try:
+                cancellation = asyncio.create_task(self.execute_cancellation(order))
+                cancellations.append((order, cancellation))
+            except Exception as e:
+                print(f"error cancelling order {order} {e}")
+                print_async_exception(cancellation)
+                traceback.print_exc()
+        results = []
+        for cancellation in cancellations:
+            result = None
+            try:
+                result = await cancellation[1]
+                results.append(result)
+            except Exception as e:
+                print(f"error cancelling order {cancellation} {e}")
+                print_async_exception(result)
+                traceback.print_exc()
+        return results
 
     async def execute_order(self, order: dict) -> dict:
         params = {

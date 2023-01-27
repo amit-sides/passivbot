@@ -14,7 +14,7 @@ import numpy as np
 import pprint
 
 from njit_funcs import round_
-from passivbot import Bot
+from passivbot import Bot, logging
 from procedures import print_async_exception, print_
 from pure_funcs import ts_to_date, sort_dict_keys, date_to_ts
 
@@ -24,13 +24,18 @@ def first_capitalized(s: str):
 
 
 def truncate_float(x: float, d: int) -> float:
+    if x is None:
+        return 0.0
     xs = str(x)
     return float(xs[: xs.find(".") + d + 1])
 
 
 class BitgetBot(Bot):
     def __init__(self, config: dict):
+        self.is_logged_into_user_stream = False
         self.exchange = "bitget"
+        self.max_n_orders_per_batch = 50
+        self.max_n_cancellations_per_batch = 60
         super().__init__(config)
         self.base_endpoint = "https://api.bitget.com"
         self.endpoints = {
@@ -41,6 +46,8 @@ class BitgetBot(Bot):
             "ticker": "/api/mix/v1/market/ticker",
             "open_orders": "/api/mix/v1/order/current",
             "create_order": "/api/mix/v1/order/placeOrder",
+            "batch_orders": "/api/mix/v1/order/batch-orders",
+            "batch_cancel_orders": "/api/mix/v1/order/cancel-batch-orders",
             "cancel_order": "/api/mix/v1/order/cancel-order",
             "ticks": "/api/mix/v1/market/fills",
             "fills": "/api/mix/v1/order/fills",
@@ -82,7 +89,7 @@ class BitgetBot(Bot):
             self.market_type += "_linear_perpetual"
             self.product_type = "umcbl"
             self.inverse = self.config["inverse"] = False
-            self.min_cost = self.config["min_cost"] = 5.0
+            self.min_cost = self.config["min_cost"] = 5.5
         elif self.symbol.endswith("USD"):
             print("inverse perpetual")
             self.symbol += "_DMCBL"
@@ -165,11 +172,22 @@ class BitgetBot(Bot):
     async def private_(
         self, type_: str, base_endpoint: str, url: str, params: dict = {}, json_: bool = False
     ) -> dict:
+        def stringify(x):
+            if type(x) == bool:
+                return "true" if x else "false"
+            elif type(x) == float:
+                return format_float(x)
+            elif type(x) == int:
+                return str(x)
+            elif type(x) == list:
+                return [stringify(y) for y in x]
+            elif type(x) == dict:
+                return {k: stringify(v) for k, v in x.items()}
+            else:
+                return x
 
         timestamp = int(time() * 1000)
-        params = {
-            k: ("true" if v else "false") if type(v) == bool else str(v) for k, v in params.items()
-        }
+        params = {k: stringify(v) for k, v in params.items()}
         if type_ == "get":
             url = url + "?" + urlencode(sort_dict_keys(params))
             to_sign = str(timestamp) + type_.upper() + url
@@ -254,15 +272,19 @@ class BitgetBot(Bot):
             if elm["holdSide"] == "long":
                 position["long"] = {
                     "size": round_(float(elm["total"]), self.qty_step),
-                    "price": truncate_float(float(elm["averageOpenPrice"]), self.price_rounding),
-                    "liquidation_price": float(elm["liquidationPrice"]),
+                    "price": truncate_float(elm["averageOpenPrice"], self.price_rounding),
+                    "liquidation_price": 0.0
+                    if elm["liquidationPrice"] is None
+                    else float(elm["liquidationPrice"]),
                 }
 
             elif elm["holdSide"] == "short":
                 position["short"] = {
                     "size": -abs(round_(float(elm["total"]), self.qty_step)),
-                    "price": truncate_float(float(elm["averageOpenPrice"]), self.price_rounding),
-                    "liquidation_price": float(elm["liquidationPrice"]),
+                    "price": truncate_float(elm["averageOpenPrice"], self.price_rounding),
+                    "liquidation_price": 0.0
+                    if elm["liquidationPrice"] is None
+                    else float(elm["liquidationPrice"]),
                 }
         for elm in fetched_balance["data"]:
             if elm["marginCoin"] == self.margin_coin:
@@ -278,6 +300,13 @@ class BitgetBot(Bot):
                 break
 
         return position
+
+    async def execute_orders(self, orders: [dict]) -> [dict]:
+        if len(orders) == 0:
+            return []
+        if len(orders) == 1:
+            return [await self.execute_order(orders[0])]
+        return await self.execute_batch_orders(orders)
 
     async def execute_order(self, order: dict) -> dict:
         o = None
@@ -300,6 +329,7 @@ class BitgetBot(Bot):
             custom_id = order["custom_id"] if "custom_id" in order else "0"
             params["clientOid"] = f"{self.broker_code}#{custom_id}_{random_str}"
             o = await self.private_post(self.endpoints["create_order"], params)
+            # print('debug create order', o, order)
             if o["data"]:
                 # print('debug execute order', o)
                 return {
@@ -319,27 +349,81 @@ class BitgetBot(Bot):
             traceback.print_exc()
             return {}
 
-    async def execute_cancellation(self, order: dict) -> dict:
-        cancellation = None
+    async def execute_batch_orders(self, orders: [dict]) -> [dict]:
+        executed = None
         try:
-            cancellation = await self.private_post(
-                self.endpoints["cancel_order"],
-                {"symbol": self.symbol, "marginCoin": self.margin_coin, "orderId": order["order_id"]},
+            to_execute = []
+            orders_with_custom_ids = []
+            for order in orders:
+                params = {
+                    "size": str(order["qty"]),
+                    "side": self.order_side_map[order["side"]][order["position_side"]],
+                    "orderType": order["type"],
+                    "presetTakeProfitPrice": "",
+                    "presetStopLossPrice": "",
+                }
+                if params["orderType"] == "limit":
+                    params["timeInForceValue"] = "post_only"
+                    params["price"] = str(order["price"])
+                else:
+                    params["timeInForceValue"] = "normal"
+                random_str = f"{str(int(time() * 1000))[-6:]}_{int(np.random.random() * 10000)}"
+                custom_id = order["custom_id"] if "custom_id" in order else "0"
+                params["clientOid"] = order[
+                    "custom_id"
+                ] = f"{self.broker_code}#{custom_id}_{random_str}"
+                orders_with_custom_ids.append({**order, **{"symbol": self.symbol}})
+                to_execute.append(params)
+            executed = await self.private_post(
+                self.endpoints["batch_orders"],
+                {"symbol": self.symbol, "marginCoin": self.margin_coin, "orderDataList": to_execute},
             )
-            return {
-                "symbol": self.symbol,
-                "side": order["side"],
-                "order_id": cancellation["data"]["orderId"],
-                "position_side": order["position_side"],
-                "qty": order["qty"],
-                "price": order["price"],
-            }
+            formatted = []
+            for ex in executed["data"]["orderInfo"]:
+                to_add = {"order_id": ex["orderId"], "custom_id": ex["clientOid"]}
+                for elm in orders_with_custom_ids:
+                    if elm["custom_id"] == ex["clientOid"]:
+                        to_add.update(elm)
+                        formatted.append(to_add)
+                        break
+            # print('debug execute batch orders', executed, orders, formatted)
+            return formatted
         except Exception as e:
-            print(f"error cancelling order {order} {e}")
-            print_async_exception(cancellation)
+            print(f"error executing order {executed} {e}")
+            print_async_exception(executed)
             traceback.print_exc()
-            self.ts_released["force_update"] = 0.0
-            return {}
+            return []
+
+    async def execute_cancellations(self, orders: [dict]) -> [dict]:
+        if not orders:
+            return []
+        cancellations = []
+        symbol = orders[0]["symbol"] if "symbol" in orders[0] else self.symbol
+        try:
+            cancellations = await self.private_post(
+                self.endpoints["batch_cancel_orders"],
+                {
+                    "symbol": symbol,
+                    "marginCoin": self.margin_coin,
+                    "orderIds": [order["order_id"] for order in orders],
+                },
+            )
+
+            formatted = []
+            for oid in cancellations["data"]["order_ids"]:
+                to_add = {"order_id": oid}
+                for order in orders:
+                    if order["order_id"] == oid:
+                        to_add.update(order)
+                        formatted.append(to_add)
+                        break
+            # print('debug cancel batch orders', cancellations, orders, formatted)
+            return formatted
+        except Exception as e:
+            logging.error(f"error cancelling orders {orders} {e}")
+            print_async_exception(cancellations)
+            traceback.print_exc()
+            return []
 
     async def fetch_account(self):
         raise NotImplementedError("not implemented")
@@ -567,11 +651,15 @@ class BitgetBot(Bot):
             # set leverage
             res = await self.private_post(
                 self.endpoints["set_leverage"],
-                params={"symbol": self.symbol, "marginCoin": self.margin_coin, "leverage": 20},
+                params={
+                    "symbol": self.symbol,
+                    "marginCoin": self.margin_coin,
+                    "leverage": self.leverage,
+                },
             )
             print(res)
         except Exception as e:
-            print(e)
+            print("error initiating exchange config", e)
 
     def standardize_market_stream_event(self, data: dict) -> [dict]:
         if "action" not in data or data["action"] != "update":
@@ -610,7 +698,7 @@ class BitgetBot(Bot):
                 print_(["error sending heartbeat market", e])
 
     async def subscribe_to_market_stream(self, ws):
-        await ws.send(
+        res = await ws.send(
             json.dumps(
                 {
                     "op": "subscribe",
@@ -625,31 +713,7 @@ class BitgetBot(Bot):
             )
         )
 
-    async def subscribe_to_user_stream(self, ws):
-        timestamp = int(time())
-        signature = base64.b64encode(
-            hmac.new(
-                self.secret.encode("utf-8"),
-                f"{timestamp}GET/user/verify".encode("utf-8"),
-                digestmod="sha256",
-            ).digest()
-        ).decode("utf-8")
-        res = await ws.send(
-            json.dumps(
-                {
-                    "op": "login",
-                    "args": [
-                        {
-                            "apiKey": self.key,
-                            "passphrase": self.passphrase,
-                            "timestamp": timestamp,
-                            "sign": signature,
-                        }
-                    ],
-                }
-            )
-        )
-        print(res)
+    async def subscribe_to_user_streams(self, ws):
         res = await ws.send(
             json.dumps(
                 {
@@ -696,14 +760,50 @@ class BitgetBot(Bot):
         )
         print(res)
 
+    async def subscribe_to_user_stream(self, ws):
+        if self.is_logged_into_user_stream:
+            await self.subscribe_to_user_streams(ws)
+        else:
+            await self.login_to_user_stream(ws)
+
+    async def login_to_user_stream(self, ws):
+        timestamp = int(time())
+        signature = base64.b64encode(
+            hmac.new(
+                self.secret.encode("utf-8"),
+                f"{timestamp}GET/user/verify".encode("utf-8"),
+                digestmod="sha256",
+            ).digest()
+        ).decode("utf-8")
+        res = await ws.send(
+            json.dumps(
+                {
+                    "op": "login",
+                    "args": [
+                        {
+                            "apiKey": self.key,
+                            "passphrase": self.passphrase,
+                            "timestamp": timestamp,
+                            "sign": signature,
+                        }
+                    ],
+                }
+            )
+        )
+        print(res)
+
     async def transfer(self, type_: str, amount: float, asset: str = "USDT"):
-        return {"code": "-1", "msg": "Transferring funds not supported for Bybit"}
+        return {"code": "-1", "msg": "Transferring funds not supported for Bitget"}
 
     def standardize_user_stream_event(
         self, event: Union[List[Dict], Dict]
     ) -> Union[List[Dict], Dict]:
 
         events = []
+        if "event" in event and event["event"] == "login":
+            self.is_logged_into_user_stream = True
+            return {"logged_in": True}
+        # logging.info(f"debug 0 {event}")
         if "arg" in event and "data" in event and "channel" in event["arg"]:
             if event["arg"]["channel"] == "orders":
                 for elm in event["data"]:
@@ -730,18 +830,25 @@ class BitgetBot(Bot):
                             standardized["filled"] = True
                         events.append(standardized)
             if event["arg"]["channel"] == "positions":
+                long_pos = {"psize_long": 0.0, "pprice_long": 0.0}
+                short_pos = {"psize_short": 0.0, "pprice_short": 0.0}
                 for elm in event["data"]:
                     if elm["instId"] == self.symbol and "averageOpenPrice" in elm:
-                        standardized = {
-                            f"psize_{elm['holdSide']}": round_(
-                                abs(float(elm["total"])), self.qty_step
+                        if elm["holdSide"] == "long":
+                            long_pos["psize_long"] = round_(abs(float(elm["total"])), self.qty_step)
+                            long_pos["pprice_long"] = truncate_float(
+                                elm["averageOpenPrice"], self.price_rounding
                             )
-                            * (-1 if elm["holdSide"] == "short" else 1),
-                            f"pprice_{elm['holdSide']}": truncate_float(
-                                float(elm["averageOpenPrice"]), self.price_rounding
-                            ),
-                        }
-                        events.append(standardized)
+                        elif elm["holdSide"] == "short":
+                            short_pos["psize_short"] = -abs(
+                                round_(abs(float(elm["total"])), self.qty_step)
+                            )
+                            short_pos["pprice_short"] = truncate_float(
+                                elm["averageOpenPrice"], self.price_rounding
+                            )
+                # absence of elemet means no pos
+                events.append(long_pos)
+                events.append(short_pos)
 
             if event["arg"]["channel"] == "account":
                 for elm in event["data"]:
